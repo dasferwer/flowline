@@ -1,0 +1,44 @@
+services:
+  database:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: flowline
+    ports: ["127.0.0.1:54834:5432"]
+    volumes: ["database:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d flowline"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: demo
+      RABBITMQ_DEFAULT_PASS: demo
+    ports: ["127.0.0.1:5634:5672"]
+  api:
+    build: .
+    environment: &environment
+      DATABASE_URL: postgresql://demo:demo@database/flowline
+      API_KEY: local-demo-key
+      AMQP_URL: amqp://demo:demo@rabbitmq:5672/%2F
+    ports: ["127.0.0.1:8094:8000"]
+    depends_on:
+      database: {condition: service_healthy}
+  worker:
+    build: .
+    command: ["python", "-m", "flowline.worker"]
+    environment: *environment
+    depends_on:
+      database: {condition: service_healthy}
+      rabbitmq: {condition: service_started}
+  scheduler:
+    build: .
+    command: ["python", "-m", "flowline.scheduler"]
+    environment: *environment
+    depends_on:
+      database: {condition: service_healthy}
+volumes:
+  database:
