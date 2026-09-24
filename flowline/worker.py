@@ -1,11 +1,13 @@
 import logging
 import os
+import threading
 import time
 
 import pika
+from psycopg import Error
 
 from flowline.db import init
-from flowline.engine import claim, finish
+from flowline.engine import claim, finish, renew
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,30 @@ def execute(node):
     return value
 
 
+def process(node, heartbeat_interval=3):
+    stopped = threading.Event()
+
+    def heartbeat():
+        while not stopped.wait(heartbeat_interval):
+            try:
+                if not renew(node):
+                    return
+            except Error:
+                return
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        try:
+            return finish(node, execute(node))
+        except Exception as exc:
+            logger.exception("Задача завершилась ошибкой")
+            return finish(node, error=str(exc))
+    finally:
+        stopped.set()
+        thread.join(timeout=2)
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("pika").setLevel(logging.WARNING)
@@ -31,11 +57,7 @@ def main():
         try:
             node = claim()
             if node:
-                try:
-                    finish(node, execute(node))
-                except Exception as exc:
-                    logger.exception("Задача завершилась ошибкой")
-                    finish(node, error=str(exc))
+                process(node)
                 continue
             try:
                 with pika.BlockingConnection(pika.URLParameters(os.environ["AMQP_URL"])) as broker:

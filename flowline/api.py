@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
 from flowline.db import connect, init
-from flowline.engine import create, validate
+from flowline.engine import create, retry, validate
 
 
 @asynccontextmanager
@@ -32,7 +32,7 @@ class Node(BaseModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,49}$")
     task: Literal["constant", "sum", "divide"]
     value: int = Field(default=0, ge=-1000000, le=1000000)
-    delay: float = Field(default=0, ge=0, le=5)
+    delay: float = Field(default=0, ge=0, le=120)
     dependencies: list[str] = Field(default_factory=list, max_length=50)
 
 
@@ -135,7 +135,37 @@ def cancel(identity: uuid.UUID):
         )
         if changed.rowcount:
             conn.execute(
+                "UPDATE attempts SET status='cancelled',finished_at=clock_timestamp() WHERE run_id=%s AND status='running'",
+                (identity,),
+            )
+            conn.execute(
                 "UPDATE nodes SET status='cancelled',token=NULL WHERE run_id=%s AND status IN ('pending','running')",
                 (identity,),
             )
     return status(identity)
+
+
+class Retry(BaseModel):
+    roots: list[str] = Field(min_length=1, max_length=50)
+
+
+@app.post("/runs/{identity}/retry")
+def repeat(identity: uuid.UUID, body: Retry):
+    try:
+        return retry(identity, body.roots)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/runs/{identity}/history")
+def history(identity: uuid.UUID):
+    status(identity)
+    with connect() as conn:
+        return {
+            "attempts": conn.execute(
+                "SELECT * FROM attempts WHERE run_id=%s ORDER BY started_at,token", (identity,)
+            ).fetchall(),
+            "retries": conn.execute(
+                "SELECT * FROM run_events WHERE run_id=%s ORDER BY id", (identity,)
+            ).fetchall(),
+        }

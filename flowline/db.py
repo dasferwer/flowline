@@ -32,4 +32,14 @@ def init():
             CREATE TABLE IF NOT EXISTS queue_state (
                 id integer PRIMARY KEY CHECK(id=1), turn bigint NOT NULL);
             INSERT INTO queue_state VALUES (1,0) ON CONFLICT DO NOTHING;
+            ALTER TABLE nodes ADD COLUMN IF NOT EXISTS started_at timestamptz;
+            ALTER TABLE runs ADD COLUMN IF NOT EXISTS generation integer NOT NULL DEFAULT 1;
+            CREATE TABLE IF NOT EXISTS attempts (
+                token uuid PRIMARY KEY,run_id uuid NOT NULL,name text NOT NULL,generation integer NOT NULL,
+                started_at timestamptz NOT NULL DEFAULT clock_timestamp(),finished_at timestamptz,
+                status text NOT NULL DEFAULT 'running',output bigint,error text);
+            CREATE TABLE IF NOT EXISTS run_events (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,run_id uuid NOT NULL,
+                generation integer NOT NULL,roots text[] NOT NULL,previous jsonb NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT now());
         """)

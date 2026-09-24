@@ -140,3 +140,61 @@ def test_latest_version_disables_daily_schedule(client):
         client.post("/definitions", json={**graph, "version": 2, "daily": False}).status_code == 200
     )
     assert tick(date(2025, 2, 1)) == []
+
+
+def test_retry_branch_preserves_unrelated_effects_and_attempt_history(client):
+    register(
+        client,
+        nodes=[
+            {"name": "a", "task": "constant", "value": 2},
+            {"name": "b", "task": "sum", "value": 3, "dependencies": ["a"]},
+            {"name": "independent", "task": "constant", "value": 9},
+        ],
+    )
+    identity = start(client)
+    while node := claim():
+        finish(node, execute(node))
+    retried = client.post(f"/runs/{identity}/retry", json={"roots": ["b"]})
+    assert retried.json() == {"generation": 2, "reset": ["b"]}
+    node = claim()
+    assert node["name"] == "b"
+    assert node["inputs"] == [2]
+    assert finish(node, execute(node))
+    assert claim() is None
+    history = client.get(f"/runs/{identity}/history").json()
+    assert len(history["attempts"]) == 4
+    assert len(history["retries"]) == 1
+    with connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM effects").fetchone()["n"] == 3
+    assert client.get(f"/runs/{identity}").json()["status"] == "completed"
+
+
+def test_cancel_retry_fences_previous_generation(client):
+    register(client)
+    identity = start(client)
+    old = claim()
+    client.post(f"/runs/{identity}/cancel")
+    response = client.post(f"/runs/{identity}/retry", json={"roots": ["a"]})
+    assert response.status_code == 200
+    assert response.json()["reset"] == ["a", "b"]
+    assert not finish(old, 900)
+    fresh = claim()
+    assert finish(fresh, execute(fresh))
+    assert client.get(f"/runs/{identity}/history").json()["attempts"][0]["status"] == "cancelled"
+
+
+def test_long_execution_keeps_lease_and_cannot_revive_expired_one(client):
+    from flowline.engine import renew
+    from flowline.worker import process
+
+    register(client, nodes=[{"name": "a", "task": "constant", "value": 1, "delay": 0.5}])
+    identity = start(client)
+    node = claim()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE nodes SET lease_until=clock_timestamp()+interval '0.3 seconds' WHERE run_id=%s",
+            (identity,),
+        )
+    assert process(node, heartbeat_interval=0.05)
+    assert not renew(node)
+    assert client.get(f"/runs/{identity}").json()["status"] == "completed"
