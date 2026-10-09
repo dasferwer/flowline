@@ -2,7 +2,7 @@ import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -124,6 +124,99 @@ def status(identity: uuid.UUID):
                 (identity,),
             ).fetchall(),
         }
+
+
+class NodeDiagnostic(BaseModel):
+    name: str
+    status: str
+    attempts: int
+    reasons: list[
+        Literal[
+            "ready",
+            "dependencies",
+            "retry_delay",
+            "run_limit",
+            "global_limit",
+            "backfill_limit",
+            "run_stopped",
+            "running",
+            "lease_expired",
+            "attempt_deadline",
+            "retry_exhausted",
+            "failed",
+            "completed",
+            "cancelled",
+        ]
+    ]
+    blocking_dependencies: list[str]
+    lease_until: datetime | None
+    available_at: datetime
+
+
+class RunDiagnostics(BaseModel):
+    id: uuid.UUID
+    status: str
+    observed_at: datetime
+    nodes: list[NodeDiagnostic]
+
+
+@app.get("/runs/{identity}/diagnostics", response_model=RunDiagnostics)
+def diagnostics(identity: uuid.UUID):
+    with connect() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        observed = conn.execute("SELECT now() AS observed").fetchone()["observed"]
+        run = conn.execute("SELECT * FROM runs WHERE id=%s", (identity,)).fetchone()
+        if not run:
+            raise HTTPException(404, "Запуск не найден")
+        nodes = conn.execute(
+            "SELECT * FROM nodes WHERE run_id=%s ORDER BY name", (identity,)
+        ).fetchall()
+        counts = conn.execute("""SELECT count(*) AS active,
+            count(*) FILTER(WHERE r.kind='backfill') AS backfills
+            FROM nodes n JOIN runs r ON r.id=n.run_id
+            WHERE n.status='running' AND r.status='running'""").fetchone()
+        by_name = {node["name"]: node for node in nodes}
+        run_active = sum(node["status"] == "running" for node in nodes)
+        result = []
+        for node in nodes:
+            reasons = []
+            blockers = sorted(
+                dep for dep in node["dependencies"] if by_name[dep]["status"] != "completed"
+            )
+            state = node["status"]
+            if state == "pending":
+                if run["status"] != "running":
+                    reasons.append("run_stopped")
+                else:
+                    if blockers:
+                        reasons.append("dependencies")
+                    if node["available_at"] > observed:
+                        reasons.append("retry_delay")
+                    if run_active >= run["parallelism"]:
+                        reasons.append("run_limit")
+                    if counts["active"] >= 4:
+                        reasons.append("global_limit")
+                    if run["kind"] == "backfill" and counts["backfills"] >= 3:
+                        reasons.append("backfill_limit")
+                    if not reasons:
+                        reasons.append("ready")
+            elif state == "running":
+                if run["status"] != "running":
+                    reasons.append("run_stopped")
+                elif node["lease_until"] is None or node["lease_until"] <= observed:
+                    reasons.append("lease_expired")
+                elif node["started_at"] is None or node["started_at"] <= observed - timedelta(
+                    minutes=5
+                ):
+                    reasons.append("attempt_deadline")
+                else:
+                    reasons.append("running")
+            elif state == "failed":
+                reasons.append("retry_exhausted" if node["attempts"] >= 3 else "failed")
+            else:
+                reasons.append(state)
+            result.append({**node, "reasons": reasons, "blocking_dependencies": blockers})
+        return {"id": identity, "status": run["status"], "observed_at": observed, "nodes": result}
 
 
 @app.post("/runs/{identity}/cancel")
